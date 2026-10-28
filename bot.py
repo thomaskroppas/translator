@@ -11,6 +11,8 @@ from pathlib import Path
 
 import anthropic
 from dotenv import load_dotenv
+from google import genai
+from google.genai import errors as genai_errors
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -23,8 +25,10 @@ from aiogram.types import (
 
 load_dotenv()
 
-MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-5-5")
-EFFORT = os.getenv("CLAUDE_EFFORT", "medium")
+PROVIDER = os.getenv("TRANSLATOR", "gemini")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-5-5")
+CLAUDE_EFFORT = os.getenv("CLAUDE_EFFORT", "medium")
 DEFAULT_LANGUAGE = "English"
 SETTINGS_PATH = Path(os.getenv("SETTINGS_PATH", "data/settings.json"))
 TELEGRAM_LIMIT = 4096
@@ -73,7 +77,6 @@ Output only the translation: no quotes around it, no notes, no alternatives, no 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("translator")
 
-claude = anthropic.AsyncAnthropic()
 dp = Dispatcher()
 
 allowed_ids = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x}
@@ -127,26 +130,69 @@ def split_text(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
     return chunks
 
 
-async def translate(text: str, language: str) -> str:
-    response = await claude.beta.messages.create(
-        model=MODEL,
-        max_tokens=16000,
-        system=SYSTEM_PROMPT,
-        thinking={"type": "adaptive"},
-        output_config={"effort": EFFORT},
-        # On a policy refusal, the API retries on a recommended fallback model.
-        betas=["server-side-fallback-2026-07-01"],
-        fallbacks="default",
-        messages=[
-            {
-                "role": "user",
-                "content": f"Target language: {language}\n\n<source_text>\n{text}\n</source_text>",
-            }
-        ],
-    )
+class TranslationError(Exception):
+    """Raised with a message that can be shown to the user as is."""
+
+
+def build_prompt(text: str, language: str) -> str:
+    return f"Target language: {language}\n\n<source_text>\n{text}\n</source_text>"
+
+
+async def translate_gemini(text: str, language: str) -> str:
+    try:
+        response = await gemini.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=build_prompt(text, language),
+            config=genai.types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+        )
+    except genai_errors.APIError as e:
+        log.exception("Gemini API error")
+        if e.code == 429:
+            raise TranslationError("Упёрлись в лимит бесплатного Gemini. Подожди минуту (или до завтра, если кончился дневной).")
+        raise TranslationError(f"Ошибка Gemini API ({e.code}). Попробуй ещё раз.")
+    except Exception:
+        log.exception("Gemini request failed")
+        raise TranslationError("Не достучался до Gemini. Попробуй ещё раз.")
+    if not response.text:
+        # Empty text means the prompt or the answer was blocked by Gemini's safety filters.
+        raise TranslationError("Gemini отказался переводить это сообщение.")
+    return response.text.strip()
+
+
+async def translate_claude(text: str, language: str) -> str:
+    try:
+        response = await claude.beta.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=16000,
+            system=SYSTEM_PROMPT,
+            thinking={"type": "adaptive"},
+            output_config={"effort": CLAUDE_EFFORT},
+            # On a policy refusal, the API retries on a recommended fallback model.
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
+            messages=[{"role": "user", "content": build_prompt(text, language)}],
+        )
+    except anthropic.RateLimitError:
+        raise TranslationError("Слишком много запросов к Claude, попробуй через минуту.")
+    except anthropic.APIStatusError as e:
+        log.exception("Claude API error")
+        raise TranslationError(f"Ошибка Claude API ({e.status_code}). Попробуй ещё раз.")
+    except anthropic.APIConnectionError:
+        log.exception("Claude connection error")
+        raise TranslationError("Не достучался до Claude. Попробуй ещё раз.")
     if response.stop_reason == "refusal":
-        raise RuntimeError("refusal")
+        raise TranslationError("Claude отказался переводить это сообщение.")
     return "".join(block.text for block in response.content if block.type == "text").strip()
+
+
+if PROVIDER == "claude":
+    claude = anthropic.AsyncAnthropic()
+    translate = translate_claude
+elif PROVIDER == "gemini":
+    gemini = genai.Client()  # reads GEMINI_API_KEY
+    translate = translate_gemini
+else:
+    raise SystemExit(f"Unknown TRANSLATOR={PROVIDER!r}, expected 'gemini' or 'claude'")
 
 
 @dp.update.outer_middleware()
@@ -197,19 +243,8 @@ async def on_text(message: Message, bot: Bot) -> None:
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     try:
         translation = await translate(message.text, get_language(message.from_user.id))
-    except anthropic.RateLimitError:
-        await message.reply("Слишком много запросов к Claude, попробуй через минуту.")
-        return
-    except anthropic.APIStatusError as e:
-        log.exception("Claude API error")
-        await message.reply(f"Ошибка Claude API ({e.status_code}). Попробуй ещё раз.")
-        return
-    except anthropic.APIConnectionError:
-        log.exception("Claude connection error")
-        await message.reply("Не достучался до Claude. Попробуй ещё раз.")
-        return
-    except RuntimeError:
-        await message.reply("Модель отказалась переводить это сообщение.")
+    except TranslationError as e:
+        await message.reply(str(e))
         return
 
     for chunk in split_text(translation or "…"):
@@ -223,6 +258,7 @@ async def on_other(message: Message) -> None:
 
 async def main() -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
+    log.info("Translating with %s", GEMINI_MODEL if PROVIDER == "gemini" else CLAUDE_MODEL)
     if not allowed_ids:
         log.warning("ALLOWED_USER_IDS is empty: the bot will translate for anyone who finds it")
 
